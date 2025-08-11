@@ -121,7 +121,10 @@ impl<T: SegArrayObject> IntoIterator for SegArray<T> {
     type IntoIter = SegArrayIterator<T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        todo!()
+        SegArrayIterator {
+            array: self,
+            idx: 0,
+        }
     }
 }
 
@@ -134,7 +137,13 @@ impl<T: SegArrayObject> Iterator for SegArrayIterator<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if (self.idx as usize) < self.array.len() {
+            let res = self.array[self.idx].clone();
+            self.idx += 1;
+            Some(res)
+        } else {
+            None
+        }
     }
 }
 
