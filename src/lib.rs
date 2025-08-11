@@ -55,11 +55,10 @@ where
         }
 
         for i in old_segment_count..new_segment_count {
-            let idx = old_segment_count + i;
-            debug_assert!(idx < 32);
-            self.segments[idx as usize] = Some({
+            debug_assert!(i < 32);
+            self.segments[i as usize] = Some({
                 let mut v = Vec::new();
-                v.resize_with(1 << idx, T::default);
+                v.resize_with(1 << i, T::default);
                 v.into_boxed_slice()
             });
         }
