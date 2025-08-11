@@ -1,18 +1,22 @@
 use std::ops::{Index, IndexMut};
 
-pub struct SegArray<T>
-where
-    T: std::fmt::Debug + Default,
-{
+pub trait SegArrayObject: Clone + std::fmt::Debug + Default {}
+
+impl<T: Clone + std::fmt::Debug + Default> SegArrayObject for T {}
+
+pub struct SegArray<T: SegArrayObject> {
     count: u32,
     used_segments: u32,
     segments: [Option<Box<[T]>>; 32],
 }
 
-impl<T> SegArray<T>
-where
-    T: std::fmt::Debug + Default + Default,
-{
+impl<T: SegArrayObject> Default for SegArray<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: SegArrayObject> SegArray<T> {
     pub fn new() -> Self {
         Self {
             count: 0,
@@ -43,7 +47,15 @@ where
     }
 
     pub fn pop(&mut self) -> Option<T> {
-        todo!()
+        if self.count == 0 {
+            return None;
+        }
+
+        let idx = self.count - 1;
+        let res = self[idx].clone();
+        self.count = idx;
+
+        Some(res)
     }
 
     // TODO: actual error types
@@ -80,10 +92,7 @@ where
     }
 }
 
-impl<T> Index<u32> for SegArray<T>
-where
-    T: std::fmt::Debug + Default,
-{
+impl<T: SegArrayObject> Index<u32> for SegArray<T> {
     type Output = T;
 
     fn index(&self, index: u32) -> &Self::Output {
@@ -96,10 +105,7 @@ where
     }
 }
 
-impl<T> IndexMut<u32> for SegArray<T>
-where
-    T: std::fmt::Debug + Default,
-{
+impl<T: SegArrayObject> IndexMut<u32> for SegArray<T> {
     fn index_mut(&mut self, index: u32) -> &mut Self::Output {
         let seg_idx = Self::segment_index(index);
         let seg_slot = Self::segment_slot(index, seg_idx);
@@ -110,10 +116,7 @@ where
     }
 }
 
-impl<T> IntoIterator for SegArray<T>
-where
-    T: std::fmt::Debug + Default,
-{
+impl<T: SegArrayObject> IntoIterator for SegArray<T> {
     type Item = T;
     type IntoIter = SegArrayIterator<T>;
 
@@ -122,18 +125,12 @@ where
     }
 }
 
-pub struct SegArrayIterator<T>
-where
-    T: std::fmt::Debug + Default,
-{
+pub struct SegArrayIterator<T: SegArrayObject> {
     array: SegArray<T>,
     idx: u32,
 }
 
-impl<T> Iterator for SegArrayIterator<T>
-where
-    T: std::fmt::Debug + Default,
-{
+impl<T: SegArrayObject> Iterator for SegArrayIterator<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -178,10 +175,8 @@ mod tests {
         assert_eq!(arr.pop(), Some(99));
         assert_eq!(arr.len(), 99);
 
-        let mut x = 0;
-        for item in arr {
-            assert_eq!(item, x);
-            x += 1;
+        for (x, item) in arr.into_iter().enumerate() {
+            assert_eq!(item, x.try_into().unwrap());
         }
     }
 }
