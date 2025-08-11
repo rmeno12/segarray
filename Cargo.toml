@@ -2,5 +2,9 @@
 name = "segarray"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "A fast, growable array type with no copies"
+repository = "https://github.com/rmeno12/segarray"
+categories = ["data-structures"]
 
 [dependencies]
