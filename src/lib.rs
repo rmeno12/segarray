@@ -1,33 +1,38 @@
-use std::ops::{Index, IndexMut};
-
-pub trait SegArrayObject: Clone + std::fmt::Debug + Default {}
-
-impl<T: Clone + std::fmt::Debug + Default> SegArrayObject for T {}
+use std::{
+    alloc::Layout,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ops::{Index, IndexMut},
+};
 
 #[derive(Debug, Clone)]
-pub struct SegArray<T: SegArrayObject> {
-    count: u32,
-    used_segments: u32,
-    segments: [Option<Box<[T]>>; 32],
+pub struct SegArray<T> {
+    count: usize,
+    allocated_segments: usize,
+    segments: [*mut T; 32],
+    segment_usage: [usize; 32],
+    _marker: PhantomData<T>,
 }
 
-impl<T: SegArrayObject> Default for SegArray<T> {
+impl<T> Default for SegArray<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: SegArrayObject> SegArray<T> {
+impl<T> SegArray<T> {
     pub fn new() -> Self {
         Self {
             count: 0,
-            used_segments: 0,
-            segments: Default::default(),
+            allocated_segments: 0,
+            segments: [std::ptr::null_mut(); 32],
+            segment_usage: [0; 32],
+            _marker: PhantomData,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.count as usize
+        self.count
     }
 
     pub fn is_empty(&self) -> bool {
@@ -38,8 +43,14 @@ impl<T: SegArrayObject> SegArray<T> {
         let new_count = self.count + 1;
         match self.grow(new_count) {
             Ok(()) => {
+                let seg_idx = Self::segment_index(self.count);
+                let seg_slot = Self::segment_slot(self.count, seg_idx);
+                unsafe {
+                    let write_slot = self.segments[seg_idx].add(seg_slot);
+                    std::ptr::write(write_slot, value);
+                }
+                self.segment_usage[seg_idx] += 1;
                 self.count = new_count;
-                self[new_count - 1] = value;
             }
             Err(e) => {
                 panic!("Failed to grow: {e:?}")
@@ -53,114 +64,189 @@ impl<T: SegArrayObject> SegArray<T> {
         }
 
         let idx = self.count - 1;
-        let res = self[idx].clone();
+        let seg_idx = Self::segment_index(idx);
+        let seg_slot = Self::segment_slot(idx, seg_idx);
+        let res = unsafe { self.segments[seg_idx].add(seg_slot).read() };
+        self.segment_usage[seg_idx] -= 1;
         self.count = idx;
 
         Some(res)
     }
 
     // TODO: actual error types
-    fn grow(&mut self, new_count: u32) -> Result<(), ()> {
+    fn grow(&mut self, new_count: usize) -> Result<(), ()> {
         let new_segment_count = Self::segment_count_for_capacity(new_count);
-        let old_segment_count = self.used_segments;
+        let old_segment_count = self.allocated_segments;
         if new_segment_count <= old_segment_count {
             return Ok(());
         }
 
         for i in old_segment_count..new_segment_count {
             debug_assert!(i < 32);
-            self.segments[i as usize] = Some({
-                let mut v = Vec::new();
-                v.resize_with(1 << i, T::default);
-                v.into_boxed_slice()
-            });
+            self.segments[i] = Self::alloc_seg(1 << i);
+            self.segment_usage[i] = 0;
         }
-        self.used_segments = new_segment_count;
+        self.allocated_segments = new_segment_count;
 
         Ok(())
     }
 
-    fn segment_index(index: u32) -> u32 {
-        (index + 1).ilog2()
+    fn alloc_seg(len: usize) -> *mut T {
+        let layout = Layout::array::<T>(len).expect("Layout error");
+        let ptr = unsafe { std::alloc::alloc(layout) as *mut T };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        ptr
     }
 
-    fn segment_slot(index: u32, segment_index: u32) -> u32 {
+    fn segment_index(index: usize) -> usize {
+        (index + 1).ilog2().try_into().unwrap()
+    }
+
+    fn segment_slot(index: usize, segment_index: usize) -> usize {
         index + 1 - (1 << (segment_index))
     }
 
-    fn segment_count_for_capacity(capacity: u32) -> u32 {
+    fn segment_count_for_capacity(capacity: usize) -> usize {
         ilog2_ceil(capacity + 1)
     }
 }
 
-impl<T: SegArrayObject> Index<u32> for SegArray<T> {
+impl<T> Drop for SegArray<T> {
+    fn drop(&mut self) {
+        if self.allocated_segments == 0 {
+            return;
+        }
+
+        // Before deallocating the buffers, we have to first drop each of the `T`s in the SegArray
+        let currently_filled_segments = Self::segment_count_for_capacity(self.count);
+        for i in 0..currently_filled_segments {
+            let seg = self.segments[i];
+            unsafe {
+                let filled_seg_as_slice =
+                    std::ptr::slice_from_raw_parts_mut(seg, self.segment_usage[i] - 1);
+                std::ptr::drop_in_place(filled_seg_as_slice);
+            }
+        }
+
+        for i in 0..self.allocated_segments {
+            let seg = self.segments[i];
+            let layout = Layout::array::<T>(1 << i).unwrap();
+            unsafe {
+                std::alloc::dealloc(seg as *mut u8, layout);
+            }
+        }
+    }
+}
+
+impl<T> Index<usize> for SegArray<T> {
     type Output = T;
 
-    fn index(&self, index: u32) -> &Self::Output {
+    fn index(&self, index: usize) -> &Self::Output {
         if index >= self.count {
-            panic!("Index out of bounds (out of range)")
+            panic!(
+                "Index out of bounds: index {index} is not less than length {}",
+                self.count
+            );
         }
         let seg_idx = Self::segment_index(index);
         let seg_slot = Self::segment_slot(index, seg_idx);
-        let seg = self.segments[seg_idx as usize]
-            .as_ref()
-            .expect("Index out of bounds (segment doesn't exist)");
-        &seg[seg_slot as usize]
+        unsafe { &*self.segments[seg_idx].add(seg_slot) }
     }
 }
 
-impl<T: SegArrayObject> IndexMut<u32> for SegArray<T> {
-    fn index_mut(&mut self, index: u32) -> &mut Self::Output {
+impl<T> IndexMut<usize> for SegArray<T> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         if index >= self.count {
-            panic!("Index out of bounds (out of range)")
+            panic!(
+                "Index out of bounds: index {index} is not less than length {}",
+                self.count
+            );
         }
         let seg_idx = Self::segment_index(index);
         let seg_slot = Self::segment_slot(index, seg_idx);
-        let seg = self.segments[seg_idx as usize]
-            .as_mut()
-            .expect("Index out of bounds (segment doesn't exist)");
-        &mut seg[seg_slot as usize]
+        unsafe { &mut *self.segments[seg_idx].add(seg_slot) }
     }
 }
 
-impl<T: SegArrayObject> IntoIterator for SegArray<T> {
+impl<T> IntoIterator for SegArray<T> {
     type Item = T;
-    type IntoIter = SegArrayIterator<T>;
+    type IntoIter = SegArrayIntoIter<T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        SegArrayIterator {
-            array: self,
+        let array = ManuallyDrop::new(self);
+        SegArrayIntoIter {
             idx: 0,
+            count: array.count,
+            allocated_segments: array.allocated_segments,
+            segments: array.segments,
+            segment_usage: array.segment_usage,
+            _marker: PhantomData
         }
     }
 }
 
-pub struct SegArrayIterator<T: SegArrayObject> {
-    array: SegArray<T>,
-    idx: u32,
+pub struct SegArrayIntoIter<T> {
+    idx: usize,
+    count: usize,
+    allocated_segments: usize,
+    segments: [*mut T; 32],
+    segment_usage: [usize; 32],
+    _marker: PhantomData<T>,
 }
 
-impl<T: SegArrayObject> Iterator for SegArrayIterator<T> {
+impl<T> Iterator for SegArrayIntoIter<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if (self.idx as usize) < self.array.len() {
-            let res = self.array[self.idx].clone();
-            self.idx += 1;
-            Some(res)
-        } else {
+        if self.idx == self.count {
             None
+        } else {
+            let seg_idx = SegArray::<T>::segment_index(self.idx);
+            let seg_slot = SegArray::<T>::segment_slot(self.idx, seg_idx);
+            let item = unsafe { self.segments[seg_idx].add(seg_slot).read() };
+            self.idx += 1;
+            Some(item)
         }
     }
 }
 
-fn ilog2_ceil(x: u32) -> u32 {
+impl<T> Drop for SegArrayIntoIter<T> {
+    fn drop(&mut self) {
+        // Need to drop all elements in indices [idx, count). The ones before idx have already been
+        // moved out, so dropping them is wrong.
+        let first_seg_including_drop = SegArray::<T>::segment_count_for_capacity(self.idx + 1) - 1;
+        let currently_filled_segments = SegArray::<T>::segment_count_for_capacity(self.count);
+        let mut already_dropped = self.idx;
+        for i in first_seg_including_drop..currently_filled_segments {
+            let drop_slice_start_slot = SegArray::<T>::segment_slot(already_dropped, i);
+            let drop_slice = unsafe { self.segments[i].add(drop_slice_start_slot) };
+            let drop_slice_len = ((1 << i) - drop_slice_start_slot).min(self.segment_usage[i]);
+            unsafe {
+                let filled_seg_as_slice =
+                    std::ptr::slice_from_raw_parts_mut(drop_slice, drop_slice_len);
+                std::ptr::drop_in_place(filled_seg_as_slice);
+            }
+            already_dropped += drop_slice_len;
+        }
+
+        for i in 0..self.allocated_segments {
+            let layout = Layout::array::<T>(1 << i).unwrap();
+            unsafe {
+                std::alloc::dealloc(self.segments[i] as *mut u8, layout);
+            }
+        }
+    }
+}
+
+fn ilog2_ceil(x: usize) -> usize {
     assert!(x != 0);
     let l2 = x.ilog2();
     if 1 << l2 == x {
-        l2
+        l2.try_into().unwrap()
     } else {
-        l2 + 1
+        (l2 + 1).try_into().unwrap()
     }
 }
 
@@ -191,7 +277,8 @@ mod tests {
         assert_eq!(arr.pop(), Some(99));
         assert_eq!(arr.len(), 99);
 
-        for (x, item) in arr.into_iter().enumerate() {
+        for (x, item) in arr.into_iter().take(21).enumerate() {
+            println!("{x}");
             assert_eq!(item, x.try_into().unwrap());
         }
     }
@@ -216,14 +303,16 @@ mod tests {
             // Verify all previous elements are still correct after each append
             for j in 0..=i {
                 assert_eq!(
-                    arr[j as u32], j,
+                    arr[j.try_into().unwrap()],
+                    j,
                     "Mismatch at index {} after appending {}",
-                    j, i
+                    j,
+                    i
                 );
             }
         }
         assert_eq!(arr.len(), num_elements as usize);
-        assert_eq!(arr.used_segments, 6); // 1+2+4+8+16+32 > 35, so 6 segments
+        assert_eq!(arr.allocated_segments, 6); // 1+2+4+8+16+32 > 35, so 6 segments
     }
 
     #[test]
@@ -293,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Index out of bounds (out of range)")]
+    #[should_panic(expected = "Index out of bounds: index 2 is not less than length 2")]
     fn test_out_of_bounds_panic() {
         let mut arr: SegArray<i32> = SegArray::new();
         arr.append(10);
